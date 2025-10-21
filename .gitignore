@@ -46,3 +46,6 @@ flagged/
 
 # Logs
 *.log
+
+# Database
+novels.db

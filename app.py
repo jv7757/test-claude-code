@@ -1,13 +1,15 @@
 """
 基于 Gradio 的多智能体小说创作应用
-支持多章节创作，章节知识库参考
+支持多部小说创作，章节知识库参考，SQLite持久化存储
 包含审核循环机制：作家-评论家循环，最多修改5次
 """
 
 import gradio as gr
 from novel_writer import create_novel_writer
+from database import db
 import os
 import json
+from datetime import datetime
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -18,6 +20,7 @@ load_dotenv()
 class NovelSession:
     def __init__(self):
         self.writer = None
+        self.novel_id = None  # 当前小说ID
         self.state = None
         self.chapters = {}  # 保存已完成的章节
         self.topic = ""
@@ -31,13 +34,185 @@ class NovelSession:
 session = NovelSession()
 
 
-def create_outline(topic: str, api_key: str, model: str, base_url: str = None):
-    """创建小说大纲（第一步）"""
+# ==================== 会话管理函数 ====================
+
+def get_novels_list():
+    """获取所有小说列表，生成HTML"""
+    novels = db.get_all_novels()
+
+    if not novels:
+        return "<p style='color: #999; padding: 20px; text-align: center;'>暂无小说，请创建新小说开始创作</p>"
+
+    html = "<div style='padding: 10px;'>"
+
+    for novel in novels:
+        # 计算进度
+        progress = novel['completed_chapters']
+        total = novel['total_chapters']
+        progress_percent = int((progress / total * 100)) if total > 0 else 0
+
+        # 状态颜色
+        status_colors = {
+            'active': '#2196F3',
+            'completed': '#4CAF50',
+            'archived': '#9E9E9E'
+        }
+        status_text = {
+            'active': '进行中',
+            'completed': '已完成',
+            'archived': '已归档'
+        }
+
+        color = status_colors.get(novel['status'], '#9E9E9E')
+        status = status_text.get(novel['status'], novel['status'])
+
+        # 时间格式化
+        updated = novel['updated_at'][:16] if novel['updated_at'] else 'N/A'
+
+        html += f"""
+        <div style='
+            margin: 10px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-left: 4px solid {color};
+            background: #fafafa;
+            border-radius: 4px;
+            cursor: pointer;
+        ' onclick='alert("小说ID: {novel["id"]}，请在加载小说框中输入此ID")'>
+            <div style='display: flex; justify-content: space-between; align-items: center;'>
+                <div style='flex: 1;'>
+                    <div style='font-weight: bold; font-size: 1.1em; color: #333;'>
+                        {novel['title']}
+                    </div>
+                    <div style='font-size: 0.9em; color: #666; margin-top: 4px;'>
+                        ID: {novel['id']} | {status} | 更新: {updated}
+                    </div>
+                </div>
+                <div style='text-align: right;'>
+                    <div style='font-size: 0.9em; color: {color}; font-weight: bold;'>
+                        {progress}/{total} 章
+                    </div>
+                    <div style='width: 100px; height: 8px; background: #e0e0e0; border-radius: 4px; margin-top: 4px;'>
+                        <div style='width: {progress_percent}%; height: 100%; background: {color}; border-radius: 4px;'></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """
+
+    html += "</div>"
+    return html
+
+
+def create_new_novel_session(title: str):
+    """创建新小说会话"""
+    if not title or title.strip() == "":
+        return get_novels_list(), "❌ 请输入小说标题"
+
+    try:
+        # 重置session
+        session.novel_id = None
+        session.state = None
+        session.chapters = {}
+        session.topic = ""
+        session.overall_outline = ""
+        session.chapter_outlines = []
+        session.current_chapter = 1
+        session.total_chapters = 0
+
+        return get_novels_list(), f"✅ 已创建新会话「{title}」，现在可以输入主题并创建大纲"
+
+    except Exception as e:
+        return get_novels_list(), f"❌ 创建失败：{str(e)}"
+
+
+def load_novel_session(novel_id: int):
+    """加载现有小说会话"""
+    try:
+        novel_id = int(novel_id)
+        novel = db.get_novel(novel_id)
+
+        if not novel:
+            return get_novels_list(), "", "", "", f"❌ 未找到ID为 {novel_id} 的小说"
+
+        # 加载到session
+        session.novel_id = novel_id
+        session.topic = novel['topic']
+        session.overall_outline = novel['overall_outline']
+        session.chapter_outlines = novel['chapter_outlines']
+        session.total_chapters = novel['total_chapters']
+        session.current_chapter = 1
+
+        # 加载已完成的章节
+        chapters = db.get_completed_chapters(novel_id)
+        session.chapters = {}
+        for ch_num, ch_data in chapters.items():
+            session.chapters[ch_num] = {
+                "chapter_number": ch_data['chapter_number'],
+                "title": ch_data['title'],
+                "outline": ch_data['outline'],
+                "content": ch_data['content'],
+                "status": ch_data['status'],
+                "revision_count": ch_data['revision_count'],
+                "approved": bool(ch_data['approved']),
+                "feedback": ch_data['feedback'],
+                "all_feedbacks": ch_data['all_feedbacks']
+            }
+
+        # 生成章节列表
+        chapter_list_html = generate_chapter_list_html()
+
+        return (
+            get_novels_list(),
+            novel['overall_outline'],
+            chapter_list_html,
+            "",
+            f"✅ 已加载小说「{novel['title']}」（{len(session.chapters)}/{session.total_chapters}章完成）"
+        )
+
+    except ValueError:
+        return get_novels_list(), "", "", "", "❌ 请输入有效的数字ID"
+    except Exception as e:
+        return get_novels_list(), "", "", "", f"❌ 加载失败：{str(e)}"
+
+
+def delete_novel_session(novel_id: int):
+    """删除小说会话"""
+    try:
+        novel_id = int(novel_id)
+        novel = db.get_novel(novel_id)
+
+        if not novel:
+            return get_novels_list(), f"❌ 未找到ID为 {novel_id} 的小说"
+
+        db.delete_novel(novel_id)
+
+        # 如果删除的是当前小说，清空session
+        if session.novel_id == novel_id:
+            session.novel_id = None
+            session.state = None
+            session.chapters = {}
+
+        return get_novels_list(), f"✅ 已删除小说「{novel['title']}」"
+
+    except ValueError:
+        return get_novels_list(), "❌ 请输入有效的数字ID"
+    except Exception as e:
+        return get_novels_list(), f"❌ 删除失败：{str(e)}"
+
+
+# ==================== 原有创作函数（添加自动保存） ====================
+
+def create_outline(topic: str, title: str, api_key: str, model: str, base_url: str = None):
+    """创建小说大纲（第一步）- 添加数据库保存"""
     if not topic:
-        return "请输入小说主题！", "", ""
+        return "", "", "请输入小说主题！", get_novels_list()
+
+    if not title:
+        return "", "", "请输入小说标题！", get_novels_list()
 
     if not api_key:
-        return "请输入 OpenAI API Key！", "", ""
+        return "", "", "请输入 OpenAI API Key！", get_novels_list()
 
     try:
         # 初始化writer
@@ -75,18 +250,39 @@ def create_outline(topic: str, api_key: str, model: str, base_url: str = None):
         session.chapter_outlines = result["chapter_outlines"]
         session.total_chapters = result["total_chapters"]
 
+        # 保存到数据库
+        if session.novel_id is None:
+            # 创建新小说
+            session.novel_id = db.create_novel(
+                title=title,
+                topic=topic,
+                overall_outline=result["overall_outline"],
+                chapter_outlines=result["chapter_outlines"],
+                total_chapters=result["total_chapters"]
+            )
+        else:
+            # 更新现有小说
+            db.update_novel(
+                session.novel_id,
+                topic=topic,
+                overall_outline=result["overall_outline"],
+                chapter_outlines=result["chapter_outlines"],
+                total_chapters=result["total_chapters"]
+            )
+
         # 生成章节列表HTML
         chapter_list_html = generate_chapter_list_html()
 
         return (
             result["overall_outline"],
             chapter_list_html,
-            f"✅ 成功创建包含 {session.total_chapters} 个章节的大纲！现在可以选择章节开始创作。"
+            f"✅ 成功创建包含 {session.total_chapters} 个章节的大纲！（小说ID: {session.novel_id}）",
+            get_novels_list()
         )
 
     except Exception as e:
         error_msg = f"创建大纲时出现错误：{str(e)}"
-        return error_msg, "", error_msg
+        return "", "", error_msg, get_novels_list()
 
 
 def generate_chapter_list_html():
@@ -135,9 +331,12 @@ def generate_chapter_list_html():
 
 
 def create_current_chapter(chapter_num: int):
-    """创作指定章节"""
+    """创作指定章节 - 添加数据库保存"""
     if not session.writer or not session.state:
-        return "请先创建大纲！", "", "", "", generate_chapter_list_html()
+        return "请先创建大纲！", "", "", "", generate_chapter_list_html(), get_novels_list()
+
+    if session.novel_id is None:
+        return "请先保存小说（创建大纲时会自动保存）", "", "", "", generate_chapter_list_html(), get_novels_list()
 
     try:
         # 更新当前章节号
@@ -165,7 +364,7 @@ def create_current_chapter(chapter_num: int):
             state = session.writer._writer_agent(state)
             state = session.writer._critic_agent(state)
 
-        # 保存章节
+        # 保存章节到内存
         current_outline = next((ch for ch in session.chapter_outlines if ch["number"] == chapter_num), {})
         session.chapters[chapter_num] = {
             "chapter_number": chapter_num,
@@ -179,6 +378,20 @@ def create_current_chapter(chapter_num: int):
             "all_feedbacks": state["all_feedbacks"]
         }
 
+        # 保存章节到数据库
+        db.create_or_update_chapter(
+            novel_id=session.novel_id,
+            chapter_number=chapter_num,
+            title=current_outline.get("title", f"第{chapter_num}章"),
+            outline=current_outline.get("summary", ""),
+            content=state["draft"],
+            status="completed",
+            revision_count=state["revision_count"],
+            approved=state["approved"],
+            feedback=state["feedback"],
+            all_feedbacks=state["all_feedbacks"]
+        )
+
         # 更新session状态
         session.state = state
 
@@ -189,6 +402,7 @@ def create_current_chapter(chapter_num: int):
 - **修改次数**: {state['revision_count']} 次
 - **审核结果**: {'✅ 通过' if state['approved'] else '⚠️ 未通过（已达最大修改次数）'}
 - **最终版本**: 第 {state['revision_count']} 版
+- **已保存到数据库**: 小说ID {session.novel_id}
 
 ---
 """
@@ -196,38 +410,18 @@ def create_current_chapter(chapter_num: int):
         # 更新章节列表
         chapter_list_html = generate_chapter_list_html()
 
-        # 当前章节内容
-        current_content = state["draft"]
-
-        # 最新反馈
-        current_feedback = state["feedback"]
-
-        # 所有反馈历史
-        all_feedbacks = state["all_feedbacks"]
-
         return (
             status_info,
-            current_content,
-            current_feedback,
-            all_feedbacks,
-            chapter_list_html
+            state["draft"],
+            state["feedback"],
+            state["all_feedbacks"],
+            chapter_list_html,
+            get_novels_list()
         )
 
     except Exception as e:
         error_msg = f"创作第{chapter_num}章时出现错误：{str(e)}"
-        return error_msg, "", "", "", generate_chapter_list_html()
-
-
-def get_chapter_content(chapter_num: int):
-    """获取指定章节的内容"""
-    if chapter_num not in session.chapters:
-        return f"第{chapter_num}章尚未创作", ""
-
-    chapter = session.chapters[chapter_num]
-    content = chapter["content"]
-    feedback = chapter.get("all_feedbacks", chapter.get("feedback", ""))
-
-    return content, feedback
+        return error_msg, "", "", "", generate_chapter_list_html(), get_novels_list()
 
 
 def export_novel():
@@ -250,6 +444,39 @@ def export_novel():
     return novel_text
 
 
+def get_statistics():
+    """获取统计信息"""
+    stats = db.get_statistics()
+
+    stats_html = f"""
+    <div style='padding: 15px; background: #f5f5f5; border-radius: 8px;'>
+        <h3 style='margin-top: 0;'>📊 统计信息</h3>
+        <div style='display: grid; grid-template-columns: 1fr 1fr; gap: 10px;'>
+            <div style='padding: 10px; background: white; border-radius: 4px;'>
+                <div style='font-size: 0.9em; color: #666;'>总小说数</div>
+                <div style='font-size: 1.5em; font-weight: bold; color: #2196F3;'>{stats['total_novels']}</div>
+            </div>
+            <div style='padding: 10px; background: white; border-radius: 4px;'>
+                <div style='font-size: 0.9em; color: #666;'>活跃小说</div>
+                <div style='font-size: 1.5em; font-weight: bold; color: #4CAF50;'>{stats['active_novels']}</div>
+            </div>
+            <div style='padding: 10px; background: white; border-radius: 4px;'>
+                <div style='font-size: 0.9em; color: #666;'>总章节数</div>
+                <div style='font-size: 1.5em; font-weight: bold; color: #FF9800;'>{stats['total_chapters']}</div>
+            </div>
+            <div style='padding: 10px; background: white; border-radius: 4px;'>
+                <div style='font-size: 0.9em; color: #666;'>已完成章节</div>
+                <div style='font-size: 1.5em; font-weight: bold; color: #9C27B0;'>{stats['completed_chapters']}</div>
+            </div>
+        </div>
+    </div>
+    """
+
+    return stats_html
+
+
+# ==================== Gradio界面 ====================
+
 def create_gradio_app():
     """创建 Gradio 应用界面"""
 
@@ -265,34 +492,70 @@ def create_gradio_app():
         padding: 15px;
         border-radius: 8px;
     }
+    .session-panel {
+        background-color: #fff;
+        padding: 15px;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        margin-bottom: 15px;
+    }
     """
 
     with gr.Blocks(css=custom_css, title="AI多智能体小说创作系统", theme=gr.themes.Soft()) as app:
         gr.Markdown(
             """
-            # 📚 AI多智能体小说创作系统（多章节版）
+            # 📚 AI多智能体小说创作系统（会话管理版）
 
-            这是一个基于 **LangGraph** 的多智能体协作小说创作系统，支持多章节创作：
+            支持多部小说创作、章节知识库参考、SQLite持久化存储
 
             - 🎬 **策划者**：创建包含多个章节的详细大纲
-            - ✍️ **作家**：逐章创作，参考已完成章节（知识库）
+            - ✍️ **作家**：逐章创作，参考已完成章节
             - 🎭 **评论家**：严格评审每章质量
-
-            ## 🔄 工作流程
-
-            1. **创建大纲** → 策划者生成多章节详细大纲
-            2. **选择章节** → 从目录中选择要创作的章节
-            3. **智能创作** → 作家创作，评论家审核（最多修改5次）
-            4. **知识库参考** → 后续章节自动参考已完成章节，保持连贯性
+            - 💾 **持久化**：所有小说和章节自动保存到数据库
 
             ---
             """
         )
 
         with gr.Row():
-            # 左侧：配置和控制面板
+            # 左侧：会话管理和配置
             with gr.Column(scale=1):
-                gr.Markdown("### ⚙️ 配置")
+                with gr.Group(elem_classes=["session-panel"]):
+                    gr.Markdown("### 📂 会话管理")
+
+                    with gr.Tab("新建小说"):
+                        new_title_input = gr.Textbox(
+                            label="小说标题",
+                            placeholder="输入小说标题...",
+                            lines=1
+                        )
+                        create_session_btn = gr.Button("➕ 创建新小说", variant="primary")
+
+                    with gr.Tab("加载小说"):
+                        load_id_input = gr.Number(
+                            label="小说ID",
+                            value=1,
+                            minimum=1,
+                            precision=0
+                        )
+                        load_session_btn = gr.Button("📂 加载小说", variant="secondary")
+
+                    with gr.Tab("删除小说"):
+                        delete_id_input = gr.Number(
+                            label="小说ID",
+                            value=1,
+                            minimum=1,
+                            precision=0
+                        )
+                        delete_session_btn = gr.Button("🗑️ 删除小说", variant="stop")
+
+                    session_status = gr.Textbox(
+                        label="操作提示",
+                        lines=2,
+                        interactive=False
+                    )
+
+                gr.Markdown("### ⚙️ API配置")
 
                 api_key_input = gr.Textbox(
                     label="OpenAI API Key",
@@ -313,10 +576,16 @@ def create_gradio_app():
                     value="gpt-4o-mini"
                 )
 
-                gr.Markdown("### 📝 小说主题")
+                gr.Markdown("### 📝 创作")
+
+                novel_title_input = gr.Textbox(
+                    label="小说标题",
+                    placeholder="为当前小说输入标题...",
+                    lines=1
+                )
 
                 topic_input = gr.Textbox(
-                    label="请输入小说主题或简要描述",
+                    label="小说主题或简要描述",
                     placeholder="例如：一个关于时间旅行的科幻故事...",
                     lines=4
                 )
@@ -339,20 +608,6 @@ def create_gradio_app():
                 gr.Markdown("---")
 
                 export_btn = gr.Button("💾 导出完整小说", variant="secondary")
-
-                gr.Markdown(
-                    """
-                    ### 💡 使用提示：
-                    1. 输入主题，点击"创建大纲"
-                    2. 查看右侧章节目录
-                    3. 选择章节号，点击"创作该章节"
-                    4. 可按任意顺序创作章节
-                    5. 后续章节会参考已完成章节
-                    6. 全部完成后可导出小说
-
-                    ⏱️ 每章创作约2-5分钟
-                    """
-                )
 
             # 中间：主要内容区
             with gr.Column(scale=2):
@@ -397,44 +652,60 @@ def create_gradio_app():
                             elem_classes=["output-box"]
                         )
 
-            # 右侧：章节目录侧边栏
+            # 右侧：章节目录和小说列表
             with gr.Column(scale=1, elem_classes=["sidebar"]):
-                gr.Markdown("### 📑 章节目录")
-                chapter_list_display = gr.HTML(
-                    value="<p>请先创建大纲</p>",
-                    label="章节列表"
-                )
+                with gr.Tabs():
+                    with gr.TabItem("📑 章节目录"):
+                        chapter_list_display = gr.HTML(
+                            value="<p>请先创建大纲</p>",
+                            label="章节列表"
+                        )
 
-                outline_status = gr.Textbox(
-                    label="操作提示",
-                    lines=3,
-                    interactive=False
-                )
+                    with gr.TabItem("📚 小说列表"):
+                        novels_list_display = gr.HTML(
+                            value=get_novels_list(),
+                            label="所有小说"
+                        )
 
-        # 示例
-        gr.Markdown("### 📚 示例主题")
-        gr.Examples(
-            examples=[
-                ["一个关于AI觉醒的科幻故事，探讨人工智能与人类情感的关系，包含多个场景转换"],
-                ["古代武侠小说，一个少年从习武到复仇的成长历程"],
-                ["现代都市爱情故事，两个陌生人从相遇到相爱的过程"],
-                ["悬疑推理小说，侦探在孤岛上调查连环谋杀案"],
-                ["奇幻冒险故事，勇者召集伙伴、收集神器、最终拯救王国"]
-            ],
-            inputs=topic_input
-        )
+                        refresh_list_btn = gr.Button("🔄 刷新列表", size="sm")
+
+                    with gr.TabItem("📊 统计"):
+                        statistics_display = gr.HTML(
+                            value=get_statistics(),
+                            label="统计信息"
+                        )
+
+                        refresh_stats_btn = gr.Button("🔄 刷新统计", size="sm")
 
         # 事件绑定
+        create_session_btn.click(
+            fn=create_new_novel_session,
+            inputs=[new_title_input],
+            outputs=[novels_list_display, session_status]
+        )
+
+        load_session_btn.click(
+            fn=load_novel_session,
+            inputs=[load_id_input],
+            outputs=[novels_list_display, outline_output, chapter_list_display, outline_output, session_status]
+        )
+
+        delete_session_btn.click(
+            fn=delete_novel_session,
+            inputs=[delete_id_input],
+            outputs=[novels_list_display, session_status]
+        )
+
         create_outline_btn.click(
             fn=create_outline,
-            inputs=[topic_input, api_key_input, model_input, base_url_input],
-            outputs=[outline_output, chapter_list_display, outline_status]
+            inputs=[topic_input, novel_title_input, api_key_input, model_input, base_url_input],
+            outputs=[outline_output, chapter_list_display, session_status, novels_list_display]
         )
 
         create_chapter_btn.click(
             fn=create_current_chapter,
             inputs=[chapter_selector],
-            outputs=[status_output, current_chapter_output, current_feedback_output, all_feedback_output, chapter_list_display]
+            outputs=[status_output, current_chapter_output, current_feedback_output, all_feedback_output, chapter_list_display, novels_list_display]
         )
 
         export_btn.click(
@@ -442,30 +713,39 @@ def create_gradio_app():
             outputs=[full_novel_output]
         )
 
+        refresh_list_btn.click(
+            fn=get_novels_list,
+            outputs=[novels_list_display]
+        )
+
+        refresh_stats_btn.click(
+            fn=get_statistics,
+            outputs=[statistics_display]
+        )
+
         gr.Markdown(
             """
             ---
 
             ### 🔧 技术栈
-            - **LangGraph**: 多智能体编排框架（支持条件分支和循环）
-            - **LangChain**: LLM应用开发框架
+            - **LangGraph**: 多智能体编排框架
             - **Gradio**: Web界面框架
+            - **SQLite**: 持久化存储
             - **OpenAI API**: 大语言模型服务
 
             ### ✨ 核心特性
-            - **多章节创作**：支持创建和管理多个章节
-            - **知识库参考**：已完成章节作为知识库，供后续创作参考
-            - **智能审核循环**：每章独立审核，最多5次修改机会
-            - **章节目录**：实时显示创作进度和章节状态
-            - **灵活创作**：支持任意顺序创作章节
-            - **完整导出**：一键导出包含所有章节的完整小说
+            - **多小说管理**：支持创建和管理多部小说
+            - **持久化存储**：所有数据自动保存到SQLite数据库
+            - **会话切换**：随时加载和切换不同小说
+            - **章节知识库**：已完成章节作为知识库参考
+            - **智能审核**：每章独立审核，最多5次修改
 
-            ### 📌 注意事项
-            - 确保有有效的 OpenAI API Key
-            - 建议先用 gpt-4o-mini 测试
-            - 每章创作时间2-5分钟（取决于修改次数）
-            - 后续章节会参考前面章节，确保连贯性
-            - 可以随时查看和导出已完成章节
+            ### 📌 使用说明
+            1. 创建新小说或加载现有小说
+            2. 输入主题并创建大纲
+            3. 选择章节号并创作
+            4. 所有内容自动保存到数据库
+            5. 可随时切换到其他小说继续创作
 
             ---
 
