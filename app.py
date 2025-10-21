@@ -159,6 +159,23 @@ def load_novel_session(novel_id: int):
                 "all_feedbacks": ch_data['all_feedbacks']
             }
 
+        # 重建state（不包含writer，writer在创作章节时初始化）
+        session.state = {
+            "messages": [],
+            "topic": novel['topic'],
+            "overall_outline": novel['overall_outline'],
+            "chapter_outlines": novel['chapter_outlines'],
+            "chapters": session.chapters,
+            "current_chapter_num": 1,
+            "total_chapters": novel['total_chapters'],
+            "draft": "",
+            "feedback": "",
+            "all_feedbacks": "",
+            "current_step": "",
+            "revision_count": 0,
+            "approved": False
+        }
+
         # 生成章节列表
         chapter_list_html = generate_chapter_list_html()
 
@@ -330,13 +347,27 @@ def generate_chapter_list_html():
     return html
 
 
-def create_current_chapter(chapter_num: int):
+def create_current_chapter(chapter_num: int, api_key: str, model: str, base_url: str = None):
     """创作指定章节 - 添加数据库保存"""
-    if not session.writer or not session.state:
+    if not session.state:
         return "请先创建大纲！", "", "", "", generate_chapter_list_html(), get_novels_list()
 
     if session.novel_id is None:
         return "请先保存小说（创建大纲时会自动保存）", "", "", "", generate_chapter_list_html(), get_novels_list()
+
+    if not api_key:
+        return "请输入 OpenAI API Key！", "", "", "", generate_chapter_list_html(), get_novels_list()
+
+    # 如果session.writer不存在，重新初始化（用于加载已有小说后继续创作）
+    if not session.writer:
+        try:
+            session.writer = create_novel_writer(
+                api_key=api_key,
+                model=model,
+                base_url=base_url if base_url else None
+            )
+        except Exception as e:
+            return f"初始化AI失败：{str(e)}", "", "", "", generate_chapter_list_html(), get_novels_list()
 
     try:
         # 更新当前章节号
@@ -704,7 +735,7 @@ def create_gradio_app():
 
         create_chapter_btn.click(
             fn=create_current_chapter,
-            inputs=[chapter_selector],
+            inputs=[chapter_selector, api_key_input, model_input, base_url_input],
             outputs=[status_output, current_chapter_output, current_feedback_output, all_feedback_output, chapter_list_display, novels_list_display]
         )
 
