@@ -1,6 +1,7 @@
 """
 基于 Gradio 的多智能体小说创作应用
 使用 LangGraph 实现多个AI智能体协作创作小说
+包含审核循环机制：作家-评论家循环，最多修改5次
 """
 
 import gradio as gr
@@ -23,13 +24,13 @@ def create_novel_interface(topic: str, api_key: str, model: str, base_url: str =
         base_url: API基础URL（可选）
 
     Returns:
-        大纲、草稿、最终小说、评论反馈
+        大纲、最终小说、当前版本、评审历史、状态信息
     """
     if not topic:
-        return "请输入小说主题！", "", "", ""
+        return "请输入小说主题！", "", "", "", ""
 
     if not api_key:
-        return "请输入 OpenAI API Key！", "", "", ""
+        return "请输入 OpenAI API Key！", "", "", "", ""
 
     try:
         # 创建小说写作系统
@@ -42,16 +43,27 @@ def create_novel_interface(topic: str, api_key: str, model: str, base_url: str =
         # 创作小说
         result = writer.create_novel(topic)
 
+        # 生成状态信息
+        status_info = f"""## 创作状态
+
+- **修改次数**: {result['revision_count']} 次
+- **审核结果**: {'✅ 通过' if result['approved'] else '⚠️ 未通过（已达最大修改次数）'}
+- **最终版本**: 第 {result['revision_count']} 版
+
+---
+"""
+
         return (
             result["outline"],
-            result["draft"],
             result["final_novel"],
-            result["feedback"]
+            result["draft"],
+            result["all_feedbacks"],
+            status_info
         )
 
     except Exception as e:
         error_msg = f"创作过程中出现错误：{str(e)}"
-        return error_msg, "", "", ""
+        return error_msg, "", "", "", ""
 
 
 def create_gradio_app():
@@ -70,14 +82,25 @@ def create_gradio_app():
     with gr.Blocks(css=custom_css, title="AI多智能体小说创作系统", theme=gr.themes.Soft()) as app:
         gr.Markdown(
             """
-            # 📚 AI多智能体小说创作系统
+            # 📚 AI多智能体小说创作系统（审核循环版）
 
-            这是一个基于 **LangGraph** 的多智能体协作小说创作系统，包含四个专业AI智能体：
+            这是一个基于 **LangGraph** 的多智能体协作小说创作系统，包含三个专业AI智能体：
 
             - 🎬 **策划者**：构思故事大纲和情节结构
-            - ✍️ **作家**：根据大纲撰写生动的小说内容
-            - ✏️ **编辑**：润色和改进文本质量
-            - 🎭 **评论家**：评估作品并提供专业反馈
+            - ✍️ **作家**：根据大纲撰写并润色小说内容
+            - 🎭 **评论家**：评估作品质量并决定是否通过
+
+            ## 🔄 工作流程
+
+            ```
+            策划者（大纲） → 作家（创作） → 评论家（评审）
+                                    ↑            ↓
+                                    └─ 不通过 ←──┘
+
+            - 如果评论家通过审核：结束创作
+            - 如果评论家不通过：作家根据反馈修改（最多5次）
+            - 达到5次后：使用最后一版作为最终作品
+            ```
 
             ---
             """
@@ -132,7 +155,9 @@ def create_gradio_app():
                     3. 描述你想要的小说主题
                     4. 点击"开始创作"，等待AI智能体协作完成
 
-                    ⏱️ 创作过程大约需要 1-3 分钟
+                    ⏱️ 创作过程根据修改次数而定：
+                    - 一次通过：约2-3分钟
+                    - 需要修改：每次额外增加1-2分钟
                     """
                 )
 
@@ -140,6 +165,11 @@ def create_gradio_app():
                 gr.Markdown("### 📖 创作结果")
 
                 with gr.Tabs():
+                    with gr.TabItem("📊 创作状态"):
+                        status_output = gr.Markdown(
+                            label="创作状态信息"
+                        )
+
                     with gr.TabItem("📋 故事大纲"):
                         outline_output = gr.Textbox(
                             label="策划者创建的故事大纲",
@@ -147,23 +177,23 @@ def create_gradio_app():
                             elem_classes=["output-box"]
                         )
 
-                    with gr.TabItem("📄 初稿"):
-                        draft_output = gr.Textbox(
-                            label="作家撰写的初稿",
-                            lines=15,
-                            elem_classes=["output-box"]
-                        )
-
                     with gr.TabItem("✨ 最终作品"):
                         final_output = gr.Textbox(
-                            label="编辑润色后的最终作品",
+                            label="通过审核的最终小说",
                             lines=15,
                             elem_classes=["output-box"]
                         )
 
-                    with gr.TabItem("💬 专业点评"):
+                    with gr.TabItem("📝 当前版本"):
+                        draft_output = gr.Textbox(
+                            label="作家的当前版本",
+                            lines=15,
+                            elem_classes=["output-box"]
+                        )
+
+                    with gr.TabItem("📜 评审历史"):
                         feedback_output = gr.Textbox(
-                            label="评论家的专业反馈",
+                            label="所有评审记录",
                             lines=15,
                             elem_classes=["output-box"]
                         )
@@ -172,7 +202,7 @@ def create_gradio_app():
         create_btn.click(
             fn=create_novel_interface,
             inputs=[topic_input, api_key_input, model_input, base_url_input],
-            outputs=[outline_output, draft_output, final_output, feedback_output]
+            outputs=[outline_output, final_output, draft_output, feedback_output, status_output]
         )
 
         # 示例
@@ -193,15 +223,22 @@ def create_gradio_app():
             ---
 
             ### 🔧 技术栈
-            - **LangGraph**: 多智能体编排框架
+            - **LangGraph**: 多智能体编排框架（支持条件分支和循环）
             - **LangChain**: LLM应用开发框架
             - **Gradio**: Web界面框架
             - **OpenAI API**: 大语言模型服务
 
+            ### ✨ 新特性
+            - **智能审核循环**：评论家会严格评审作品，不通过则要求作家修改
+            - **迭代改进**：最多5次修改机会，确保作品质量
+            - **完整历史**：保存所有评审记录，可追溯改进过程
+            - **合并角色**：作家同时负责创作和润色，提高效率
+
             ### 📌 注意事项
             - 确保你有有效的 OpenAI API Key
             - 不同模型的效果和成本不同，建议先用 gpt-4o-mini 测试
-            - 创作时间取决于模型速度和网络状况
+            - 如果需要多次修改，创作时间会相应延长
+            - 评论家评分标准：7分及以上通过，否则需要修改
             - 生成的内容仅供参考和娱乐，请合理使用
 
             ---
